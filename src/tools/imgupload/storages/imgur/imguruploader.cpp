@@ -9,7 +9,11 @@
 #include "widgets/notificationwidget.h"
 
 #include <QBuffer>
-#include <QDesktopServices>
+#include <QDate>
+#include <QDir>
+#include <QFile>
+#include <QHttpMultiPart>
+#include <QHttpPart>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -17,7 +21,25 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QShortcut>
-#include <QUrlQuery>
+
+static constexpr auto UPLOAD_URL = "https://picx.19981204.xyz/rest/upload";
+static constexpr auto DELETE_URL = "https://picx.19981204.xyz/rest/del/";
+static constexpr auto API_KEY_FILE = "/.picx";
+
+static QString readApiKey()
+{
+    QFile file(QDir::homePath() + API_KEY_FILE);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return {};
+    }
+    while (!file.atEnd()) {
+        QString line = QString::fromUtf8(file.readLine()).trimmed();
+        if (line.startsWith(QStringLiteral("api-key="))) {
+            return line.mid(8);
+        }
+    }
+    return {};
+}
 
 ImgurUploader::ImgurUploader(const QPixmap& capture, QWidget* parent)
   : ImgUploaderBase(capture, parent)
@@ -35,11 +57,17 @@ void ImgurUploader::handleReply(QNetworkReply* reply)
     m_currentImageName.clear();
     QJsonDocument response = QJsonDocument::fromJson(reply->readAll());
     QJsonObject json = response.object();
-    if (reply->error() == QNetworkReply::NoError) {
-        QJsonObject data = json[QStringLiteral("data")].toObject();
-        setImageURL(data[QStringLiteral("link")].toString());
+    int code = json[QStringLiteral("code")].toInt();
+    if (reply->error() == QNetworkReply::NoError && code == 200) {
+        QJsonArray dataArr = json[QStringLiteral("data")].toArray();
+        if (dataArr.isEmpty()) {
+            setInfoLabelText(tr("No data in response."));
+            return;
+        }
+        QJsonObject data = dataArr.at(0).toObject();
+        setImageURL(QUrl(data[QStringLiteral("url")].toString()));
 
-        auto deleteToken = data[QStringLiteral("deletehash")].toString();
+        auto deleteToken = data[QStringLiteral("delToken")].toString();
 
         // save history
         m_currentImageName = imageURL().toString();
@@ -56,57 +84,77 @@ void ImgurUploader::handleReply(QNetworkReply* reply)
 
         emit uploadOk(imageURL());
     } else {
-        QString status;
-        if (json.contains(QStringLiteral("errors")) &&
-            json.value(QStringLiteral("errors")).isArray()) {
-            QJsonArray errorsArray =
-              json.value(QStringLiteral("errors")).toArray();
-            if (!errorsArray.isEmpty() && errorsArray.at(0).isObject()) {
-                QJsonObject errorObj = errorsArray.at(0).toObject();
-                status = errorObj.value(QStringLiteral("code")).toString() +
-                         " - " +
-                         errorObj.value(QStringLiteral("status")).toString();
-            }
+        QString errorMsg = json[QStringLiteral("msg")].toString();
+        if (errorMsg.isEmpty()) {
+            errorMsg = reply->errorString();
         }
-
-        setInfoLabelText(reply->errorString() + "\n" + status);
+        setInfoLabelText(errorMsg);
     }
     new QShortcut(Qt::Key_Escape, this, SLOT(close()));
 }
 
 void ImgurUploader::upload()
 {
+    QString apiKey = readApiKey();
+    if (apiKey.isEmpty()) {
+        setInfoLabelText(
+          tr("API key not found. Please set api-key in ~/.picx"));
+        return;
+    }
+
     QByteArray byteArray;
     QBuffer buffer(&byteArray);
     pixmap().save(&buffer, "PNG");
 
-    QUrlQuery urlQuery;
-    urlQuery.addQueryItem(QStringLiteral("title"), QStringLiteral(""));
-    QString description = FileNameHandler().parsedPattern();
-    urlQuery.addQueryItem(QStringLiteral("description"), description);
+    QHttpMultiPart* multiPart =
+      new QHttpMultiPart(QHttpMultiPart::FormDataType);
 
-    QUrl url(QStringLiteral("https://api.imgur.com/3/image"));
-    url.setQuery(urlQuery);
+    QHttpPart filePart;
+    filePart.setHeader(
+      QNetworkRequest::ContentDispositionHeader,
+      QVariant(
+        QStringLiteral("form-data; name=\"file\"; filename=\"image.png\"")));
+    filePart.setHeader(QNetworkRequest::ContentTypeHeader,
+                       QVariant(QStringLiteral("image/png")));
+    filePart.setBody(byteArray);
+    multiPart->append(filePart);
+
+    QString path = QDate::currentDate().toString(QStringLiteral("yyyy/MM"));
+    QHttpPart pathPart;
+    pathPart.setHeader(QNetworkRequest::ContentDispositionHeader,
+                       QVariant(QStringLiteral("form-data; name=\"path\"")));
+    pathPart.setBody(path.toUtf8());
+    multiPart->append(pathPart);
+
+    QHttpPart keyPart;
+    keyPart.setHeader(
+      QNetworkRequest::ContentDispositionHeader,
+      QVariant(QStringLiteral("form-data; name=\"api-key\"")));
+    keyPart.setBody(apiKey.toUtf8());
+    multiPart->append(keyPart);
+
+    QUrl url(UPLOAD_URL);
     QNetworkRequest request(url);
-    request.setHeader(QNetworkRequest::ContentTypeHeader,
-                      "application/application/x-www-form-urlencoded");
-    request.setRawHeader("Authorization",
-                         QStringLiteral("Client-ID %1")
-                           .arg(ConfigHandler().uploadClientSecret())
-                           .toUtf8());
 
-    m_NetworkAM->post(request, byteArray);
+    QNetworkReply* reply = m_NetworkAM->post(request, multiPart);
+    multiPart->setParent(reply);
 }
 
 void ImgurUploader::deleteImage(const QString& fileName,
                                 const QString& deleteToken)
 {
     Q_UNUSED(fileName)
-    bool successful = QDesktopServices::openUrl(
-      QUrl(QStringLiteral("https://imgur.com/delete/%1").arg(deleteToken)));
-    if (!successful) {
-        notification()->showMessage(tr("Unable to open the URL."));
-    }
-
-    emit deleteOk();
+    QUrl url(QString(DELETE_URL) + deleteToken);
+    QNetworkRequest request(url);
+    QNetworkReply* reply = m_NetworkAM->get(request);
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply]() {
+                reply->deleteLater();
+                if (reply->error() == QNetworkReply::NoError) {
+                    emit deleteOk();
+                } else {
+                    notification()->showMessage(
+                      tr("Failed to delete the image."));
+                }
+            });
 }
