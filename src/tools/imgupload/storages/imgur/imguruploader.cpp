@@ -10,8 +10,6 @@
 
 #include <QBuffer>
 #include <QDate>
-#include <QDir>
-#include <QFile>
 #include <QHttpMultiPart>
 #include <QHttpPart>
 #include <QJsonArray>
@@ -24,22 +22,7 @@
 
 static constexpr auto UPLOAD_URL = "https://picx.19981204.xyz/rest/upload";
 static constexpr auto DELETE_URL = "https://picx.19981204.xyz/rest/del/";
-static constexpr auto API_KEY_FILE = "/.picx";
-
-static QString readApiKey()
-{
-    QFile file(QDir::homePath() + API_KEY_FILE);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        return {};
-    }
-    while (!file.atEnd()) {
-        QString line = QString::fromUtf8(file.readLine()).trimmed();
-        if (line.startsWith(QStringLiteral("api-key="))) {
-            return line.mid(8);
-        }
-    }
-    return {};
-}
+static constexpr int REQUEST_TIMEOUT_MS = 10000;
 
 ImgurUploader::ImgurUploader(const QPixmap& capture, QWidget* parent)
   : ImgUploaderBase(capture, parent)
@@ -95,10 +78,10 @@ void ImgurUploader::handleReply(QNetworkReply* reply)
 
 void ImgurUploader::upload()
 {
-    QString apiKey = readApiKey();
+    QString apiKey = ConfigHandler().uploadClientSecret();
     if (apiKey.isEmpty()) {
         setInfoLabelText(
-          tr("API key not found. Please set api-key in ~/.picx"));
+          tr("API key not found. Please set it in the configuration."));
         return;
     }
 
@@ -110,10 +93,9 @@ void ImgurUploader::upload()
       new QHttpMultiPart(QHttpMultiPart::FormDataType);
 
     QHttpPart filePart;
-    filePart.setHeader(
-      QNetworkRequest::ContentDispositionHeader,
-      QVariant(
-        QStringLiteral("form-data; name=\"file\"; filename=\"image.png\"")));
+    filePart.setHeader(QNetworkRequest::ContentDispositionHeader,
+                       QVariant(QStringLiteral(
+                         "form-data; name=\"files\"; filename=\"image.png\"")));
     filePart.setHeader(QNetworkRequest::ContentTypeHeader,
                        QVariant(QStringLiteral("image/png")));
     filePart.setBody(byteArray);
@@ -126,15 +108,10 @@ void ImgurUploader::upload()
     pathPart.setBody(path.toUtf8());
     multiPart->append(pathPart);
 
-    QHttpPart keyPart;
-    keyPart.setHeader(
-      QNetworkRequest::ContentDispositionHeader,
-      QVariant(QStringLiteral("form-data; name=\"api-key\"")));
-    keyPart.setBody(apiKey.toUtf8());
-    multiPart->append(keyPart);
-
     QUrl url(UPLOAD_URL);
     QNetworkRequest request(url);
+    request.setRawHeader("X-API-Key", apiKey.toUtf8());
+    request.setTransferTimeout(REQUEST_TIMEOUT_MS);
 
     QNetworkReply* reply = m_NetworkAM->post(request, multiPart);
     multiPart->setParent(reply);
@@ -146,15 +123,14 @@ void ImgurUploader::deleteImage(const QString& fileName,
     Q_UNUSED(fileName)
     QUrl url(QString(DELETE_URL) + deleteToken);
     QNetworkRequest request(url);
+    request.setTransferTimeout(REQUEST_TIMEOUT_MS);
     QNetworkReply* reply = m_NetworkAM->get(request);
-    connect(reply, &QNetworkReply::finished, this,
-            [this, reply]() {
-                reply->deleteLater();
-                if (reply->error() == QNetworkReply::NoError) {
-                    emit deleteOk();
-                } else {
-                    notification()->showMessage(
-                      tr("Failed to delete the image."));
-                }
-            });
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        if (reply->error() == QNetworkReply::NoError) {
+            emit deleteOk();
+        } else {
+            notification()->showMessage(tr("Failed to delete the image."));
+        }
+    });
 }
